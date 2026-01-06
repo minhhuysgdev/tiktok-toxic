@@ -1,0 +1,56 @@
+# Kafka Configuration
+kafka:
+  bootstrap_servers: "localhost:9092"
+  topic_raw: "tiktok-raw"
+  consumer_group: "tiktok-processing"
+  compression_type: "gzip"
+
+# PostgreSQL Configuration
+postgres:
+  host: "localhost"
+  port: 5432
+  database: "tiktok_toxicity"
+  user: "tiktok_user"
+  password: "tiktok_pass"
+  jdbc_url: "jdbc:postgresql://localhost:5432/tiktok_toxicity"
+
+# Model Configuration
+model:
+  name: "tarudesu/ViHateT5-base-HSD"
+  device: "cpu"  # hoặc "cuda" nếu có GPU
+  batch_size: 32
+  max_length: 256
+
+# S3 Configuration
+s3:
+  endpoint_url: "https://s3.amazonaws.com"
+  access_key_id: "your_access_key_id"
+  secret_access_key: "your_secret_access_key"
+  region: "us-east-1"
+  bucket_name: "tiktok-toxicity-data"
+  raw_data_prefix: "raw/"
+  processed_data_prefix: "processed/"
+  failed_data_prefix: "failed/"
+  archive_prefix: "archive/"
+
+# Ingestion Configuration
+ingestion:
+  raw_data_dir: "./data/raw"
+  processed_dir: "./data/processed"
+  failed_dir: "./data/failed"
+  poll_interval: 10  # seconds
+  use_s3: true  # Set to true to use S3 as datasource
+
+# Speed Layer Configuration
+speed_layer:
+  checkpoint_dir: "./checkpoints/speed"
+  window_duration: "1 minutes"
+  watermark_delay: "30 seconds"
+  toxic_threshold: 0.7
+  
+# Batch Layer Configuration
+batch_layer:
+  archive_dir: "./data/archive"  
+  checkpoint_dir: "./checkpoints/batch"
+  output_mode: "overwrite"
+
