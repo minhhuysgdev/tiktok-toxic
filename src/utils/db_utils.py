@@ -274,6 +274,7 @@ def create_tables_schema(postgres_config: Dict[str, Any]):
         offensive_comments INT,
         clean_comments INT,
         toxic_ratio FLOAT,
+        hashtags TEXT[],
         PRIMARY KEY (video_id, window_end)
         """
     )

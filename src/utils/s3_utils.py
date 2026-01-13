@@ -176,7 +176,8 @@ class S3Helper:
         Returns:
             List of new S3 keys
         """
-        all_raw_files = self.list_files(self.raw_data_prefix, '.jsonl')
+        # Lấy cả .json và .jsonl
+        all_raw_files = self.list_files(self.raw_data_prefix, '.json') + self.list_files(self.raw_data_prefix, '.jsonl')
         processed_keys = {f"{self.processed_data_prefix}{Path(key).name}" for key in processed_files}
         processed_keys.update({f"{self.failed_data_prefix}{Path(key).name}" for key in processed_files})
 
