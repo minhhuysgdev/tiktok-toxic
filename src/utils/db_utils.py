@@ -275,6 +275,7 @@ def create_tables_schema(postgres_config: Dict[str, Any]):
         clean_comments INT,
         toxic_ratio FLOAT,
         hashtags TEXT[],
+        main_hashtag VARCHAR(200),
         PRIMARY KEY (video_id, window_end)
         """
     )
@@ -289,6 +290,25 @@ def create_tables_schema(postgres_config: Dict[str, Any]):
         total_comments INT,
         toxic_comments INT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        """
+    )
+    
+    helper.create_table_if_not_exists(
+        "speed_comments",
+        """
+        id SERIAL PRIMARY KEY,
+        video_id VARCHAR(100),
+        user_id VARCHAR(100),
+        comment_text TEXT,
+        toxicity_label VARCHAR(20),
+        is_toxic INT,
+        is_hate INT,
+        is_offensive INT,
+        is_clean INT,
+        hashtags TEXT[],
+        main_hashtag VARCHAR(200),
+        kafka_timestamp TIMESTAMP,
+        processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         """
     )
     

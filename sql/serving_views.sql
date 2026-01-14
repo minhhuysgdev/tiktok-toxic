@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS speed_video_stats (
     offensive_comments INT,
     clean_comments INT,
     toxic_ratio FLOAT,
+    hashtags TEXT[],
     PRIMARY KEY (video_id, window_end)
 );
 
@@ -36,6 +37,31 @@ CREATE INDEX IF NOT EXISTS idx_speed_video_stats_window_end
     ON speed_video_stats(window_end);
 CREATE INDEX IF NOT EXISTS idx_speed_alerts_video_id 
     ON speed_alerts(video_id);
+
+CREATE TABLE IF NOT EXISTS speed_hashtag_stats (
+    hashtag VARCHAR(200),
+    window_start TIMESTAMP,
+    window_end TIMESTAMP,
+    total_comments INT,
+    toxic_comments INT,
+    toxic_ratio FLOAT,
+    PRIMARY KEY (hashtag, window_end)
+);
+
+CREATE TABLE IF NOT EXISTS speed_user_stats (
+    user_id VARCHAR(100),
+    window_start TIMESTAMP,
+    window_end TIMESTAMP,
+    total_comments INT,
+    toxic_comments INT,
+    toxic_ratio FLOAT,
+    PRIMARY KEY (user_id, window_end)
+);
+
+CREATE INDEX IF NOT EXISTS idx_speed_hashtag_window_end 
+    ON speed_hashtag_stats(window_end);
+CREATE INDEX IF NOT EXISTS idx_speed_user_window_end 
+    ON speed_user_stats(window_end);
 
 -- ===================================================================
 -- 2. BATCH LAYER TABLES (Historical data)
@@ -69,6 +95,13 @@ CREATE TABLE IF NOT EXISTS batch_user_ranking (
     computed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS batch_user_groups (
+    user_id VARCHAR(100) PRIMARY KEY,
+    group_topic VARCHAR(200),
+    toxic_comment_count INT,
+    computed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE INDEX IF NOT EXISTS idx_batch_hashtag_toxic_ratio 
     ON batch_hashtag_stats(toxic_ratio DESC);
 CREATE INDEX IF NOT EXISTS idx_batch_user_toxic_ratio 
@@ -82,6 +115,7 @@ CREATE INDEX IF NOT EXISTS idx_batch_user_toxic_ratio
 -- 3.1. Video Statistics View
 -- Merge batch + speed, ưu tiên speed layer (dữ liệu mới nhất)
 -- -------------------------------------------------------------------
+DROP VIEW IF EXISTS serving_video_stats CASCADE;
 CREATE OR REPLACE VIEW serving_video_stats AS
 SELECT 
     COALESCE(s.video_id, b.video_id) AS video_id,
@@ -91,6 +125,7 @@ SELECT
     COALESCE(s.offensive_comments, b.offensive_comments, 0) AS offensive_comments,
     COALESCE(s.clean_comments, b.clean_comments, 0) AS clean_comments,
     COALESCE(s.toxic_ratio, b.toxic_ratio, 0.0) AS toxic_ratio,
+    COALESCE(s.hashtags, ARRAY[]::TEXT[]) AS hashtags,
     GREATEST(
         COALESCE(s.window_end, '1970-01-01'::TIMESTAMP), 
         COALESCE(b.computed_at, '1970-01-01'::TIMESTAMP)
@@ -109,7 +144,8 @@ FROM (
         hate_comments,
         offensive_comments,
         clean_comments,
-        toxic_ratio
+        toxic_ratio,
+        hashtags
     FROM speed_video_stats
     ORDER BY video_id, window_end DESC
 ) s
@@ -119,30 +155,73 @@ FULL OUTER JOIN batch_video_stats b USING (video_id);
 -- 3.2. Hashtag Statistics View
 -- Chỉ từ batch layer (vì speed layer không aggregate hashtags)
 -- -------------------------------------------------------------------
+DROP VIEW IF EXISTS serving_hashtag_stats CASCADE;
 CREATE OR REPLACE VIEW serving_hashtag_stats AS
 SELECT 
-    hashtag,
-    total_videos,
-    total_comments,
-    toxic_comments,
-    toxic_ratio,
-    computed_at AS last_updated
-FROM batch_hashtag_stats
+    COALESCE(s.hashtag, b.hashtag) AS hashtag,
+    COALESCE(b.total_videos, 0) AS total_videos, -- Speed layer doesn't count videos per hashtag yet
+    COALESCE(s.total_comments, b.total_comments, 0) AS total_comments,
+    COALESCE(s.toxic_comments, b.toxic_comments, 0) AS toxic_comments,
+    COALESCE(s.toxic_ratio, b.toxic_ratio, 0.0) AS toxic_ratio,
+    GREATEST(
+        COALESCE(s.window_end, '1970-01-01'::TIMESTAMP), 
+        COALESCE(b.computed_at, '1970-01-01'::TIMESTAMP)
+    ) AS last_updated
+FROM (
+    SELECT DISTINCT ON (hashtag)
+        hashtag,
+        window_end,
+        total_comments,
+        toxic_comments,
+        toxic_ratio
+    FROM speed_hashtag_stats
+    ORDER BY hashtag, window_end DESC
+) s
+FULL OUTER JOIN batch_hashtag_stats b USING (hashtag)
 ORDER BY toxic_ratio DESC;
 
 -- -------------------------------------------------------------------
 -- 3.3. User Ranking View
 -- Chỉ từ batch layer
 -- -------------------------------------------------------------------
+DROP VIEW IF EXISTS serving_user_ranking CASCADE;
 CREATE OR REPLACE VIEW serving_user_ranking AS
 SELECT 
-    user_id,
-    total_comments,
-    toxic_comments,
-    toxic_ratio,
-    computed_at AS last_updated
-FROM batch_user_ranking
+    COALESCE(s.user_id, b.user_id) AS user_id,
+    COALESCE(s.total_comments, b.total_comments, 0) AS total_comments,
+    COALESCE(s.toxic_comments, b.toxic_comments, 0) AS toxic_comments,
+    COALESCE(s.toxic_ratio, b.toxic_ratio, 0.0) AS toxic_ratio,
+    GREATEST(
+        COALESCE(s.window_end, '1970-01-01'::TIMESTAMP), 
+        COALESCE(b.computed_at, '1970-01-01'::TIMESTAMP)
+    ) AS last_updated
+FROM (
+    SELECT DISTINCT ON (user_id)
+        user_id,
+        window_end,
+        total_comments,
+        toxic_comments,
+        toxic_ratio
+    FROM speed_user_stats
+    ORDER BY user_id, window_end DESC
+) s
+FULL OUTER JOIN batch_user_ranking b USING (user_id)
 ORDER BY toxic_ratio DESC;
+
+-- -------------------------------------------------------------------
+-- 3.3.1. Toxic User Groups View
+-- Chỉ từ batch layer
+-- -------------------------------------------------------------------
+DROP VIEW IF EXISTS serving_toxic_user_groups CASCADE;
+CREATE OR REPLACE VIEW serving_toxic_user_groups AS
+SELECT 
+    group_topic,
+    COUNT(user_id) as user_count,
+    SUM(toxic_comment_count) as total_toxic_comments,
+    string_agg(user_id, ', ') as member_sample
+FROM batch_user_groups
+GROUP BY group_topic
+ORDER BY total_toxic_comments DESC;
 
 -- -------------------------------------------------------------------
 -- 3.4. Real-time Alerts View
@@ -240,7 +319,6 @@ $$;
 GRANT CONNECT ON DATABASE tiktok_toxicity TO powerbi_reader;
 GRANT USAGE ON SCHEMA public TO powerbi_reader;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO powerbi_reader;
-GRANT SELECT ON ALL VIEWS IN SCHEMA public TO powerbi_reader;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public 
     GRANT SELECT ON TABLES TO powerbi_reader;
 

@@ -62,45 +62,41 @@ SELECT * FROM serving_video_stats LIMIT 5;
 
 ## 🏗️ Kiến Trúc
 
-```
-┌─────────────────┐
-│  TikTok Data    │
-│  (JSON/JSONL)   │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────────────────────────────────┐
-│         INGESTION LAYER                      │
-│   json_to_kafka.py → Apache Kafka           │
-└────────┬────────────────────────────────────┘
-         │
-         ├──────────────────┬─────────────────┐
-         ▼                  ▼                 ▼
-┌────────────────┐  ┌────────────────┐  ┌────────────────┐
-│  SPEED LAYER   │  │  BATCH LAYER   │  │  DATA ARCHIVE  │
-│  (Streaming)   │  │  (Daily Batch) │  │  (Historical)  │
-│                │  │                │  │                │
-│ Spark Struct.  │  │ Spark Batch    │  │ Parquet/JSON   │
-│ Streaming      │  │ Recompute      │  │                │
-│                │  │                │  │                │
-│ ViHateT5 Model │  │ ViHateT5 Model │  │                │
-│ (Real-time)    │  │ (Full data)    │  │                │
-└────────┬───────┘  └────────┬───────┘  └────────────────┘
-         │                   │
-         └──────────┬────────┘
-                    ▼
-         ┌──────────────────────┐
-         │  PostgreSQL Database  │
-         │  - Batch Tables       │
-         │  - Speed Tables       │
-         │  - Serving Views      │
-         └──────────┬───────────┘
-                    │
-                    ▼
-         ┌──────────────────────┐
-         │     Power BI          │
-         │  (Dashboards)         │
-         └──────────────────────┘
+```mermaid
+graph TD
+    %% Source
+    S3["📦 AWS S3 (Raw Data)<br/>Lưu trữ file JSON/JSONL"]
+    
+    %% Ingestion
+    S3 --> KAFKA["🚀 Apache Kafka<br/>Hệ thống truyền tin (Message Broker)"]
+    
+    %% Split to Lambda
+    KAFKA --> SPEED["⚡ Speed Layer (Spark Streaming)<br/>Xử lý Real-time (cửa sổ 5 phút)"]
+    KAFKA --> BATCH["📚 Batch Layer (Spark Batch)<br/>Xử lý định kỳ toàn bộ dữ liệu"]
+    
+    %% Analysis in Layers
+    subgraph Analysis ["AI & Phân tích"]
+        SPEED --- MODEL["🧠 Model ViHateT5<br/>Phát hiện độc hại ngay lập tức"]
+        BATCH --- DEEP["🔍 Phân tích sâu<br/>Gom nhóm người dùng & Hashtag"]
+    end
+    
+    %% Database
+    SPEED --> DB[("💾 PostgreSQL (Serving Layer)<br/>Lưu trữ bảng Speed & Batch")]
+    BATCH --> DB
+    
+    %% Unified View
+    DB --> VIEW["👁️ SQL Views<br/>Gộp dữ liệu Real-time + Historical"]
+    
+    %% Visualization
+    VIEW --> TABLEAU["📊 Tableau Dashboard<br/>Hiển thị báo cáo & Cảnh báo"]
+
+    %% Styling
+    style S3 fill:#f9f,stroke:#333,stroke-width:2px
+    style KAFKA fill:#bbf,stroke:#333,stroke-width:2px
+    style SPEED fill:#ff9,stroke:#333,stroke-width:2px
+    style BATCH fill:#9f9,stroke:#333,stroke-width:2px
+    style DB fill:#f96,stroke:#333,stroke-width:2px
+    style TABLEAU fill:#3cf,stroke:#333,stroke-width:4px
 ```
 
 ### Lambda Architecture Components
@@ -391,7 +387,7 @@ model:
 
 speed_layer:
   window_duration: "5 minutes"
-  toxic_threshold: 0.7
+  toxic_threshold: 0.4
 ```
 
 ## 🐛 Troubleshooting

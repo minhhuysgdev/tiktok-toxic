@@ -31,9 +31,12 @@ PACKAGES="org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,org.postgresql:postgr
 
 # Spark configurations
 SPARK_CONFIGS=(
-    "--conf spark.sql.shuffle.partitions=8"
-    "--conf spark.sql.adaptive.enabled=true"
-    "--conf spark.sql.adaptive.coalescePartitions.enabled=true"
+    "--conf" "spark.sql.shuffle.partitions=8"
+    "--conf" "spark.sql.adaptive.enabled=true"
+    "--conf" "spark.sql.adaptive.coalescePartitions.enabled=true"
+    "--conf" "spark.driver.extraJavaOptions=-Djava.net.preferIPv4Stack=true"
+    "--conf" "spark.executor.extraJavaOptions=-Djava.net.preferIPv4Stack=true"
+    "--conf" "spark.driver.host=127.0.0.1"
 )
 
 echo ""
@@ -52,7 +55,7 @@ spark-submit \
 # Refresh materialized views
 echo ""
 echo "Refreshing PostgreSQL materialized views..."
-PGPASSWORD='tiktok_pass' psql -h localhost -U tiktok_user -d tiktok_toxicity -c "SELECT refresh_serving_views();"
+docker-compose exec -T -e PGPASSWORD=tiktok_pass postgres psql -U tiktok_user -d tiktok_toxicity -c "SELECT refresh_serving_views();"
 
 echo ""
 echo "=========================================="

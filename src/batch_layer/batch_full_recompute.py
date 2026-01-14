@@ -11,8 +11,10 @@ import yaml
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     from_json, col, explode, count, sum as spark_sum,
-    when, current_timestamp, collect_list, size, flatten
+    when, current_timestamp, collect_list, size, flatten,
+    row_number
 )
+from pyspark.sql.window import Window
 from pyspark.sql.types import (
     StructType, StructField, StringType, ArrayType
 )
@@ -113,6 +115,7 @@ class BatchToxicityProcessor:
             .format("kafka") \
             .option("kafka.bootstrap.servers", self.kafka_config['bootstrap_servers']) \
             .option("subscribe", self.kafka_config['topic_raw']) \
+            .option("kafka.request.timeout.ms", "120000") \
             .option("startingOffsets", "earliest") \
             .option("endingOffsets", "latest") \
             .load()
@@ -289,6 +292,40 @@ class BatchToxicityProcessor:
         logger.info(f"✓ Computed ranking for {user_stats.count()} users")
         return user_stats
     
+    def compute_user_groups(self, df):
+        """
+        Nhóm người dùng có chung hành vi toxic theo hashtag
+        """
+        logger.info("Computing toxic user groups...")
+        
+        # 1. Lấy comments toxic và explode hashtags
+        toxic_user_hashtags = df.filter(col("is_toxic") == 1) \
+            .select(col("user_id"), explode(col("hashtags")).alias("hashtag"))
+            
+        if toxic_user_hashtags.count() == 0:
+            logger.warning("No toxic comments found for user grouping")
+            return None
+            
+        # 2. Tìm hashtag toxic nhất của mỗi user
+        user_top_hashtag = toxic_user_hashtags.groupBy("user_id", "hashtag") \
+            .agg(count("*").alias("hashtag_count"))
+            
+        # Window function để lấy top 1 hashtag cho mỗi user
+        window_spec = Window.partitionBy("user_id").orderBy(col("hashtag_count").desc())
+        
+        user_groups = user_top_hashtag.withColumn("rn", row_number().over(window_spec)) \
+            .filter(col("rn") == 1) \
+            .select(
+                col("user_id"),
+                col("hashtag").alias("group_topic"),
+                col("hashtag_count").alias("toxic_comment_count")
+            )
+            
+        user_groups = user_groups.withColumn("computed_at", current_timestamp())
+        
+        logger.info(f"✓ Created {user_groups.count()} user-group mappings")
+        return user_groups
+    
     def write_to_postgres(self, df, table_name: str, mode: str = "overwrite"):
         """
         Ghi DataFrame vào PostgreSQL
@@ -319,7 +356,7 @@ class BatchToxicityProcessor:
         try:
             # 1. Read data (try archive first, fallback to Kafka)
             df = self.read_from_archive()
-            if df is None:
+            if df is None or df.count() == 0:
                 df = self.read_from_kafka()
             
             if df is None or df.count() == 0:
@@ -344,6 +381,11 @@ class BatchToxicityProcessor:
             # 5. Compute user ranking
             user_ranking = self.compute_user_ranking(toxicity_df)
             self.write_to_postgres(user_ranking, "batch_user_ranking", mode="overwrite")
+            
+            # 6. Compute user groups
+            user_groups = self.compute_user_groups(toxicity_df)
+            if user_groups:
+                self.write_to_postgres(user_groups, "batch_user_groups", mode="overwrite")
             
             logger.info("=" * 60)
             logger.info("✓ Batch processing completed successfully")

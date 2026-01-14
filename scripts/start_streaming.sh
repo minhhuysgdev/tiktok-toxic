@@ -40,8 +40,19 @@ spark-submit \
     --conf spark.sql.shuffle.partitions=4 \
     --conf spark.streaming.stopGracefullyOnShutdown=true \
     --conf spark.sql.streaming.schemaInference=true \
-    --driver-memory 2g \
-    --executor-memory 2g \
+    --conf spark.driver.memory=8g \
+    --conf spark.executor.memory=8g \
+    --conf spark.driver.maxResultSize=2g \
+    --conf spark.memory.offHeap.enabled=true \
+    --conf spark.memory.offHeap.size=2g \
+    --conf spark.sql.adaptive.coalescePartitions.enabled=false \
+    --conf spark.sql.adaptive.enabled=false \
+    --conf spark.network.timeout=300s \
+    --conf spark.executor.heartbeatInterval=60s \
+    --conf spark.sql.streaming.kafka.consumer.cache.timeout=300s \
+    --conf spark.driver.extraJavaOptions="-Djava.net.preferIPv4Stack=true" \
+    --conf spark.executor.extraJavaOptions="-Djava.net.preferIPv4Stack=true" \
+    --conf spark.driver.host=127.0.0.1 \
     src/speed_layer/streaming_toxicity.py
 
 echo ""

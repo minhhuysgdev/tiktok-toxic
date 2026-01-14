@@ -90,11 +90,11 @@ class StreamingToxicityProcessor:
             batch_size=self.model_config.get('batch_size', 32)
         )
 
-        # Tạo UDF cho main hashtag
+        # Tạo UDF cho main hashtag (cached để tránh re-initialization)
         main_hashtags_list = list(self.speed_config.get('main_hashtags', []))
         get_main_hashtag_partial = partial(get_main_hashtag, main_hashtags=main_hashtags_list)
-        self.get_main_hashtag_udf = udf(get_main_hashtag_partial, StringType())
-
+        self.get_main_hashtag_udf = udf(get_main_hashtag_partial, StringType()).asNondeterministic()
+        
         logger.info("✓ StreamingToxicityProcessor initialized")
     
     def _preload_model(self):
@@ -132,23 +132,21 @@ class StreamingToxicityProcessor:
                     "org.postgresql:postgresql:42.7.3") \
             .config("spark.sql.streaming.checkpointLocation",
                     self.speed_config['checkpoint_dir']) \
-            .config("spark.sql.shuffle.partitions", "4") \
-            .config("spark.driver.memory", "512m") \
-            .config("spark.executor.memory", "512m") \
-            .config("spark.sql.adaptive.enabled", "true") \
-            .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
+            .config("spark.sql.shuffle.partitions", "1") \
+            .config("spark.driver.memory", "1g") \
+            .config("spark.executor.memory", "1g") \
+            .config("spark.sql.adaptive.enabled", "false") \
+            .config("spark.sql.adaptive.coalescePartitions.enabled", "false") \
             .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
             .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
             .config("spark.driver.maxResultSize", "2g") \
-            .config("spark.executor.cores", "2") \
-            .config("spark.default.parallelism", "4") \
+            .config("spark.executor.cores", "1") \
+            .config("spark.default.parallelism", "1") \
+            .config("spark.sql.shuffle.partitions", "1") \
             .config("spark.memory.fraction", "0.8") \
             .config("spark.memory.storageFraction", "0.3") \
             .config("spark.kryoserializer.buffer.max", "1024m") \
             .config("spark.sql.execution.arrow.maxRecordsPerBatch", "10000") \
-            .config("spark.sql.streaming.stateStore.stateSchemaCheck", "false") \
-            .config("spark.sql.streaming.disabledV2StreamingWriters", "true") \
-            .config("spark.sql.streaming.stopActiveRunOnRestart", "true") \
             .getOrCreate()
 
         spark.sparkContext.setLogLevel("WARN")
@@ -193,8 +191,12 @@ class StreamingToxicityProcessor:
         ).select("kafka_timestamp", "data.*")
     
     def process_comments(self, df):
-        """Xử lý comments đơn giản: chỉ explode và detect toxicity"""
-        # Explode comments array thành individual rows
+        """Xử lý comments: explode và detect toxicity"""
+        import time
+
+        # 1. Explode comments
+        logger.info("🔍 Đang explode comments...")
+        start_explode = time.time()
         exploded_df = df.select(
             col("video_id"), col("kafka_timestamp"), col("hashtags"),
             explode(col("comments")).alias("comment")
@@ -203,19 +205,37 @@ class StreamingToxicityProcessor:
             col("comment.user_id").alias("user_id"),
             col("comment.text").alias("comment_text")
         )
+        explode_time = time.time() - start_explode
+        logger.info(f"✓ Explode xong ({explode_time:.3f}s)")
 
-        # Filter comments có text
+        # 2. Filter valid comments (có text)
+        logger.info("🔍 Đang filter comments hợp lệ...")
+        start_filter = time.time()
         filtered_df = exploded_df.filter(col("comment_text").isNotNull() & (col("comment_text") != ""))
+        filter_time = time.time() - start_filter
+        logger.info(f"✓ Filter xong ({filter_time:.3f}s) - Số lượng sẽ được tính trong batch processing")
 
-        # Detect toxicity
+        # 3. Detect toxicity (bottleneck chính)
+        logger.info("🤖 Đang detect toxicity (có thể mất 5-20s lần đầu)...")
+        start_detect = time.time()
         result = filtered_df.withColumn("toxicity_label", self.toxicity_udf(col("comment_text"))) \
             .withColumn("is_toxic", when(col("toxicity_label").isin(["HATE", "OFFENSIVE"]), 1).otherwise(0)) \
             .withColumn("is_hate", when(col("toxicity_label") == "HATE", 1).otherwise(0)) \
             .withColumn("is_offensive", when(col("toxicity_label") == "OFFENSIVE", 1).otherwise(0)) \
             .withColumn("is_clean", when(col("toxicity_label") == "CLEAN", 1).otherwise(0))
+        detect_time = time.time() - start_detect
+        logger.info(f"✓ Detect toxicity xong ({detect_time:.2f}s)")
 
         return result
     
+    def prepare_comments_for_db(self, df):
+        """Chuẩn bị comments để ghi vào PostgreSQL"""
+        return df.select(
+            "video_id", "user_id", "comment_text", "toxicity_label",
+            "is_toxic", "is_hate", "is_offensive", "is_clean",
+            "hashtags", "kafka_timestamp"
+        ).withColumn("main_hashtag", self.get_main_hashtag_udf(col("hashtags"))) \
+         .withColumn("processed_at", current_timestamp())
     
     
     def write_to_postgres(self, df, table_name: str):
@@ -232,27 +252,34 @@ class StreamingToxicityProcessor:
         checkpoint_dir = f"{self.speed_config['checkpoint_dir']}/{table_name}"
         
         def write_batch(batch_df, batch_id):
-            """Ghi batch vào PostgreSQL đơn giản hiệu quả"""
+            """Ghi batch vào PostgreSQL"""
+            import time
+            batch_start = time.time()
+
             try:
-                # Check empty
+                logger.info(f"🔍 Batch {batch_id} - Bắt đầu xử lý...")
+
+                # Check if empty
+                sample_check = time.time()
                 if not batch_df.take(1):
+                    logger.info(f"⚠️  Batch {batch_id} is empty, skipping")
                     return
 
                 row_count = batch_df.count()
-                logger.info(f"📦 Batch {batch_id}: {row_count} comments -> {table_name}")
+                check_time = time.time() - sample_check
+                logger.info(f"📦 Batch {batch_id}: {row_count} comments -> {table_name} (check: {check_time:.3f}s)")
 
-                # Add main_hashtag and processed_at columns
-                db_df = batch_df.withColumn("main_hashtag", self.get_main_hashtag_udf(col("hashtags"))) \
-                               .withColumn("processed_at", current_timestamp())
+                # Prepare data for insert
+                prepare_start = time.time()
+                logger.info("💾 Đang chuẩn bị data để insert...")
+                db_df = self.prepare_comments_for_db(batch_df)
+                prepare_time = time.time() - prepare_start
+                logger.info(f"✓ Chuẩn bị xong ({prepare_time:.3f}s)")
 
-                # Chia partitions để ghi parallel (tăng tốc độ)
-                num_partitions = max(1, row_count // 100)  # 1 partition per 100 rows
-                num_partitions = min(num_partitions, 8)    # Max 8 partitions
-
-                logger.info(f"📝 Ghi với {num_partitions} partitions...")
-
-                # Ghi parallel vào DB
-                db_df.repartition(num_partitions).write.format("jdbc") \
+                # Insert to PostgreSQL
+                logger.info("📝 Đang insert vào PostgreSQL...")
+                insert_start = time.time()
+                db_df.write.format("jdbc") \
                     .option("url", jdbc_url) \
                     .option("dbtable", table_name) \
                     .option("user", properties["user"]) \
@@ -260,10 +287,20 @@ class StreamingToxicityProcessor:
                     .option("driver", properties["driver"]) \
                     .option("batchsize", "1000") \
                     .option("rewriteBatchedStatements", "true") \
+                    .option("numPartitions", "1") \
+                    .option("isolationLevel", "NONE") \
+                    .option("truncate", "false") \
                     .mode("append") \
                     .save()
 
-                logger.info(f"✓ Đã lưu {row_count} comments")
+                insert_time = time.time() - insert_start
+                total_time = time.time() - batch_start
+                logger.info(f"✓ Đã lưu {row_count} comments ({insert_time:.2f}s insert, {total_time:.2f}s total)")
+
+                # Performance metrics
+                if row_count > 0:
+                    per_comment = total_time / row_count * 1000
+                    logger.info(f"   📊 Performance: {per_comment:.1f}ms/comment, {row_count/total_time:.1f} comments/sec")
 
             except Exception as e:
                 logger.error(f"❌ Lỗi batch {batch_id}: {e}", exc_info=True)
@@ -281,38 +318,58 @@ class StreamingToxicityProcessor:
         return query
     
     def run(self):
-        """Chạy streaming pipeline đơn giản hiệu quả"""
+        """Chạy streaming pipeline - Đơn giản: chỉ detect và lưu comments"""
         logger.info("🚀 Starting Spark Streaming...")
 
-        # Pre-load model để nhanh hơn
+        # Pre-load model để tránh bottleneck load lần đầu
         self._preload_model()
 
         try:
-            # Đọc từ Kafka
+            # Read Kafka -> Process -> Write Comments to DB
             raw_stream = self.read_from_kafka()
-
-            # Process comments
-            processed_stream = self.process_comments(raw_stream)
-
-            # Ghi vào DB
-            query = self.write_to_postgres(processed_stream, "speed_comments")
-
+            toxicity_stream = self.process_comments(raw_stream)
+            
+            # Chỉ lưu comments vào DB (đơn giản)
+            comments_query = self.write_to_postgres(
+                self.prepare_comments_for_db(toxicity_stream), 
+                "speed_comments"
+            )
+            
             logger.info("✓ Streaming started - Đang đợi dữ liệu từ Kafka...")
-            logger.info("   Comments sẽ được detect toxicity và lưu vào DB")
-
-            query.awaitTermination()
-
+            logger.info("   Comments sẽ được detect toxicity và lưu vào speed_comments")
+            comments_query.awaitTermination()
+        
         except KeyboardInterrupt:
             logger.info("\n✓ Shutting down...")
+            try:
+                if 'comments_query' in locals():
+                    comments_query.stop()
+            except Exception as e:
+                logger.warning(f"Error stopping query: {e}")
+        
         except Exception as e:
             logger.error(f"Streaming error: {e}", exc_info=True)
+            try:
+                if 'comments_query' in locals():
+                    comments_query.stop()
+            except:
+                pass
             raise
+        
         finally:
+            # Đợi một chút để query dừng hoàn toàn
+            import time
+            time.sleep(1)
             try:
                 self.spark.stop()
                 logger.info("✓ Spark session stopped")
             except Exception as e:
                 logger.warning(f"Error stopping Spark session: {e}")
+
+            # Log final performance summary
+            logger.info("=" * 60)
+            logger.info("🏁 Streaming session ended")
+            logger.info("=" * 60)
 
 
 def main():
